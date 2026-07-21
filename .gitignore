@@ -1,0 +1,24 @@
+# === 模型权重 & 大数据 (~13GB) ===
+models/esm2_650M/
+models/PUPS/
+models/alphafold_pdb/
+models/alphafold_pdb_clean/
+models/FoldX/
+models/tabpfn-v2-classifier.ckpt
+models/_2022_ML-ddG-Blaabjerg-main/
+
+# === 缓存 & 临时文件 ===
+*.pkl
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+*.egg-info/
+*.local
+
+# === IDE & Claude ===
+.claude/
+.vscode/
+
+# === 环境变量 ===
+.env
