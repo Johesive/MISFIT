@@ -6,8 +6,10 @@ models/alphafold_pdb_clean/
 models/FoldX/
 models/tabpfn-v2-classifier.ckpt
 models/_2022_ML-ddG-Blaabjerg-main/
+models/deeploc2_package/
 
 # === 缓存 & 临时文件 ===
+xgboost_trial/alphamissense_cache/
 *.pkl
 __pycache__/
 *.pyc
@@ -22,3 +24,8 @@ __pycache__/
 
 # === 环境变量 ===
 .env
+xgboost_trial/deeploc2/
+models/deeploc2_package/deeploc2/wt_predictions_fast_esm1b.csv
+models/deeploc2_package/deeploc2/pilot_mt_predictions_fast_esm1b.csv
+models/deeploc2_package/deeploc2/remaining_mt_predictions_fast_esm1b.csv
+models/deeploc2_package/deeploc2/all_predictions_fast_esm1b.csv

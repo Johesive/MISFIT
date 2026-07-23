@@ -84,3 +84,41 @@ After downloading from the FoldX website, place the binary at `models/FoldX/fold
 ```bash
 chmod +x models/FoldX/foldx
 ```
+
+---
+
+## 7. DeepLoc 2.0 (Task 18)
+
+- **Source**: DTU DeepLoc 2.0 academic download
+- **Local package**: `models/deeploc2_package/`
+- **Version declared by the package**: `DeepLoc2==1.0.0`
+- **Used by**: `xgboost_trial/task18_deeploc_delta.ipynb`
+- **Publication**: Thumuluri, V. et al. (2022), *DeepLoc 2.0: multi-label subcellular localization prediction using protein language models*, Nucleic Acids Research, 50(W1), W228–W234. <https://doi.org/10.1093/nar/gkac278>
+
+The package and its checkpoints are deliberately not tracked in git. The user must obtain the software and accept the applicable DTU licence personally. Check the licence again before publication, redistribution, or commercial use.
+
+Install the downloaded package in a dedicated environment rather than modifying its source files:
+
+```bash
+cd models/deeploc2_package
+python -m pip install .
+deeploc2 -f test.fasta -o outputs -m Fast -d cpu
+```
+
+For the project experiment, use one model setting throughout. The current default is **Fast / ESM1b**. Do not mix Fast/ESM1b and Accurate/ProtT5 predictions in one feature table.
+
+Important implementation details verified from the downloaded package:
+
+- Fast/ESM1b clips sequences longer than 1,022 residues to the first 511 and last 511 residues. Task 18 records this status because an internal mutation may be removed by clipping.
+- Accurate/ProtT5 permits up to 4,000 residues but requires substantially more memory and may download `Rostlab/prot_t5_xl_uniref50` on first use.
+- The standard CLI CSV contains the predicted localisation labels, predicted sorting-signal labels, and ten localisation probabilities.
+- The CLI does **not** export the nine sorting-signal probabilities. They are computed internally by the five-checkpoint ensemble. Task 18 therefore uses a local inference adapter to preserve these probabilities without editing the downloaded package.
+- The downloaded CLI names only eight signal classes even though the internal signal head and threshold vector are nine-dimensional. The ninth class is the GPI-anchor class described in the DeepLoc 2.0 paper. Task 18 validates the tensor dimension and uses an explicit nine-class order before analysis.
+- The package checkpoints for the localisation and sorting-signal heads are present under `DeepLoc2/models/`. The ESM1b or ProtT5 backbone may still need to be available in the environment cache.
+
+Expected Task 18 raw output contains:
+
+- `sequence_id`;
+- ten localisation probabilities;
+- nine sorting-signal probabilities;
+- model setting, original length, effective length, and Fast-model clipping metadata.
