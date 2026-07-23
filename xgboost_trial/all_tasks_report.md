@@ -1,12 +1,341 @@
 # 错定位预测模型完整分析报告
 
-关键：由于PUPS效果不好，所以试着xgboost。
-**数据**: 2179 行 (主表 2089 + additional_benign 90), 1288 特征 (ESM2=1280 + 结构=8)  
-**标签**: 二分类 y = (`reloc_v3` > 0), base_rate = 222/2179 ≈ 0.102  
-**CV**: StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42, groups=Gene)  
-**模型**: XGBoost (n_estimators=200, max_depth=4, lr=0.05)
+## 当前权威状态（更新于 2026-07-23）
+
+本节记录经过本轮数据审查和代码修正后的数据口径、pipeline 与结果。后面的 Task 1–Task 6 为早期实验记录，其中部分标签、特征维度和实现已经被修正，不能再作为当前模型结论。
+
+### 0. 冻结的 primary model：XGBoost 70D
+
+自 2026-07-23 起，MISFIT 的 primary model 冻结为 **XGBoost 70D (`wt_signal_70`)**。此前的 64D XGBoost 保留为 ablation baseline；Task 17 中“保留 64D”的结论是当时尚无 DeepLoc features 时的历史决策，已被 Task 18 和后续固定 8:1:1 benchmark 取代。
+
+#### Primary-model feature contract
+
+| Feature group | Dimensions | Frozen definition |
+|---|---:|---|
+| ESM2 local WT–MT delta | 50 | 1280D local delta embedding；仅在 training fold/split 内完成 median imputation、standardisation 和 PCA(50) |
+| Structure | 7 | `plddt`, `sasa`, `rsa`, `ss_helix`, `ss_strand`, `ss_coil`, `delta_hydrophobicity` |
+| Stability-related | 4 | `ddg_esm2`, `ddg_struct`, `ddg_rasp`, `ddg_foldx` |
+| TMD | 3 | `in_TMD`, `dist_to_nearest_TMD`, `delta_membrane_insertion` |
+| DeepLoc WT sorting context | 6 | Fast/ESM1b WT probabilities：signal peptide、mitochondrial transit peptide、NLS、NES、PTS、GPI anchor |
+| **Total** | **70** | 不包含 WT localisation probabilities、DeepLoc TM probability、plant-specific signals 或 WT–MT DeepLoc deltas |
+
+同一 protein/gene 的 variants 共享六个 WT sorting-signal probabilities；它们是 externally supervised protein-level context。64D部分为 variant-level representation。所有 joins 必须使用 canonical `KEY = Gene + "||" + Mutation_used`；禁止依赖 row order。
+
+#### Frozen XGBoost hyperparameters
+
+```python
+XGBClassifier(
+    n_estimators=200,
+    max_depth=4,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.5,
+    objective="binary:logistic",
+    eval_metric="aucpr",
+    random_state=42,
+    n_jobs=-1,
+    tree_method="hist",
+)
+```
+
+Training 使用 `compute_sample_weight("balanced", y_train)`。后续不得根据现有 OOF 或 fixed test 结果调整 feature set、split、hyperparameters 或 random state 后仍将其描述为同一个冻结模型；任何改变必须使用新的 model/version 名称。
+
+以上冻结的是实际 notebook 显式传入的 estimator arguments。原始服务器运行没有记录 `xgboost`、`scikit-learn`、Python 与 CUDA 的完整版本，因此目前无法承诺跨环境 byte-for-byte identical predictions。发布或生成最终 artefact 前应导出服务器 environment；若依赖版本变化，即使参数名相同，也应做 prediction checksum/reproduction check。
+
+#### Authoritative primary-model results
+
+| Evaluation | Model | n / positives | AUROC | AUPRC |
+|---|---|---:|---:|---:|
+| Five-fold gene-disjoint pooled OOF | XGB64 | 2179 / 236 | 0.6422 | 0.1981 |
+| Five-fold gene-disjoint pooled OOF | **XGB70** | 2179 / 236 | **0.6560** | **0.2479** |
+| Fixed gene-disjoint 8:1:1 test | XGB64 | 210 / 23 | 0.6266 | 0.2075 |
+| Fixed gene-disjoint 8:1:1 test | **XGB70** | 210 / 23 | **0.7012** | **0.2843** |
+
+Paired gene-cluster bootstrap（2,000 replicates，conditional on fixed predictions）：
+
+| Comparison | ΔAUROC mean (95% CI) | ΔAUPRC mean (95% CI) |
+|---|---:|---:|
+| XGB70 − XGB64，pooled OOF | +0.0138 (−0.0194, +0.0449) | +0.0472 (+0.0130, +0.0843) |
+| XGB70 − XGB64，fixed test | +0.073 (+0.008, +0.140) | +0.072 (−0.089, +0.205) |
+
+Primary-model selection 是基于 pooled OOF、fixed-test point estimates、稳定性、计算效率和可解释性的综合 pragmatic decision。Bootstrap 不包含 split、PCA、retraining 或 model-selection uncertainty；fixed test 已在多轮模型比较中使用，不能描述为 untouched independent validation。
+
+神经网络筛选没有改变该决定：MLP64/70 在 fixed test 上分别为 0.6661/0.2720 和 0.6536/0.2751（AUROC/AUPRC），没有通过 paired bootstrap 显示相对 XGBoost 的可靠增量；FT-Transformer 更弱。因此 MLP 与 FT-Transformer 不继续推进。
+
+### 1. 当前研究任务与数据
+
+- 当前任务为二分类：预测 single amino acid variant 是否导致 protein mislocalisation。
+- 总样本数：2179，其中主表 2089，Additional Benign Variants 90。
+- 总基因数：871。
+- 负例：1943；正例：236；prevalence/base rate = 0.1083。
+- 当前二分类 target 直接使用 `Mislocalized`，不再用 `df["label_5class"].notna()` 或 `reloc_v3 > 0` 间接生成。后两种写法会把标签是否缺失与二分类生物学定义混在一起。
+- 多分类标签仅用于描述错定位 phenotype；C0 为不重定位，C1–C5 为不同错定位类型。
+
+| Class | Phenotype | n |
+|---|---|---:|
+| C0 | 不重定位 | 1943 |
+| C1 | 同区室 | 13 |
+| C2 | 聚集 | 34 |
+| C3 | 分泌途径 | 121 |
+| C4 | 核定位 | 29 |
+| C5 | 细胞质 | 39 |
+| C1–C5 | 二分类正例合计 | 236 |
+
+Additional Benign Variants 与 Variant Annotation 的原始表结构不同，因此在 data preparation 阶段显式构建标签。已人工核对并将 `RPE65 K294T` 归入 `C5_cytoplasmic`；其 `Mislocalized = 1`。这一修改写入：
+
+- `data_preparation/3.5.1_classifier_label.ipynb`
+- `data_preparation/完整代码.py`
+
+### 2. Variant identifier 修正
+
+当前 canonical identifier 为：
+
+```python
+KEY = Gene + "||" + Mutation_used
+```
+
+`Mutation_used` 是经过 data preparation 统一和校验、供模型 pipeline 使用的突变表示。2179 个样本的 `KEY` 均唯一。
+
+旧 ESM2 pickle 的 key 是历史格式 `Gene||Variant`。在已有 cache 重新生成前，Task 0 仅为读取旧 pickle 保留：
+
+```python
+legacy_esm_key = Gene + "||" + Variant
+```
+
+该 legacy key 只允许用于 ESM2 cache lookup，不能成为导出特征表的 identifier。canonical `KEY` 与 legacy key 仅有 88 行相同；此前直接用 `Gene||Mutation_used` 查询旧 cache，导致特征矩阵错误缩减到 88 行。修正后的 Task 0 会要求最终保留全部 2179 行，并在 ESM embedding 缺失时直接报错。
+
+### 3. 当前特征定义与完整性
+
+基础模型使用：
+
+- ESM2 embedding：1280 维；随后在每个 CV training fold 内拟合 PCA，保留 50 PCs。
+- 结构特征：7 维，分别为 `plddt`, `sasa`, `rsa`, `ss_helix`, `ss_strand`, `ss_coil`, `delta_hydrophobicity`。
+- stability 特征：`ddg_esm2`, `ddg_struct`, `ddg_rasp`, `ddg_foldx`。
+- TMD 特征：3 维，分别为 `in_TMD`, `dist_to_nearest_TMD`, `delta_membrane_insertion`。
+
+当前本地数据可用性：
+
+| Feature | 非缺失/总数 |
+|---|---:|
+| 7 个结构特征整体 | 2179/2179 |
+| `ddg_esm2` | 2179/2179 |
+| `ddg_struct` | 2168/2179 |
+| `ddg_rasp` | 2168/2179 |
+| `ddg_foldx` | 2166/2179 |
+| 3 个 TMD 特征的 key match | 2179/2179 |
+
+TMD 信号分布：`in_TMD` 非零 151 行，`dist_to_nearest_TMD` 非零 664 行，`delta_membrane_insertion` 非零 151 行。
+
+所有 imputer、scaler 和 PCA 都必须只在每个 training fold 上拟合，随后转换对应 validation fold，防止 data leakage。CV 使用 gene-grouped split，防止同一 gene 同时进入 training 和 validation。
+
+### 4. AlphaMissense 缺失值补全
+
+新增 `task0.5_complete_alphamissense.ipynb`，放在 Task 0 特征构建之后、AlphaMissense baseline 之前。其逻辑为：
+
+1. 保留原有 AlphaMissense score；
+2. 对缺失且属于 nonsynonymous mutation 的行，依据 protein accession 查询 AlphaFold DB metadata API，并读取 `amAnnotationsUrl`；
+3. synonymous mutation 标为 `not_applicable_synonymous`，不伪造分数；
+4. 记录每行 retrieval status，失败或无 annotation URL 的样本保持缺失；
+5. 导出 `alphamissense_completed.csv`，identifier 使用 canonical `KEY`。
+
+运行结果：
+
+- 原始有分数：2053。
+- 原始缺失：126，其中 nonsynonymous 95，synonymous 31。
+- 成功补回：87。
+- `no_annotation_url`：7。
+- query error：1（protein accession `P07203`）。
+- 最终可用 AlphaMissense score：2140/2179。
+
+最终 status 分布为：`original` 2053、`retrieved` 87、`not_applicable_synonymous` 31、`no_annotation_url` 7、query error 1。没有对剩余缺失值作数值插补；AlphaMissense 对比只在 score 实际可用的 paired cohort 上进行。
+
+### 5. Task 12：61 维 stability ablation（当前已运行结果）
+
+`task12_ddg_ablation.ipynb` 已重写。所有配置共享同一组 grouped CV folds，并在 fold 内执行预处理：
+
+| 配置 | 维度 | 组成 |
+|---|---:|---|
+| `baseline_pca_struct` | 57 | PCA(50) + structure(7) |
+| `plus_ddg_esm2` | 58 | 57D + `ddg_esm2` |
+| `plus_structure_ddgs` | 60 | 58D + `ddg_struct` + `ddg_rasp` |
+| `final_all_ddgs` | 61 | 60D + `ddg_foldx` |
+
+Full-cohort out-of-fold results：
+
+| Model | n | Positive | AUROC | AUPRC | ΔAUROC vs 57D |
+|---|---:|---:|---:|---:|---:|
+| 57D baseline | 2179 | 236 | 0.5898 | 0.1567 | 0.0000 |
+| 58D + `ddg_esm2` | 2179 | 236 | 0.6112 | 0.1688 | +0.0214 |
+| 60D + structure-derived ddGs | 2179 | 236 | 0.6038 | 0.1697 | +0.0140 |
+| 61D all ddGs | 2179 | 236 | 0.6286 | 0.1758 | +0.0388 |
+
+Paired AlphaMissense comparison（同一 2140 个样本，positive = 235，prevalence = 0.1098）：
+
+| Predictor | AUROC | AUPRC |
+|---|---:|---:|
+| AlphaMissense | 0.6491 | 0.1619 |
+| MISFIT 61D | 0.6311 | 0.1780 |
+| MISFIT − AlphaMissense | −0.0179 | +0.0160 |
+
+61D 模型中 stability-related feature importance：
+
+| Feature | Importance | Rank |
+|---|---:|---:|
+| `ddg_esm2` | 0.036686 | 1 |
+| `ddg_rasp` | 0.022989 | 2 |
+| `ddg_foldx` | 0.016574 | 26 |
+| `ddg_struct` | 0.016096 | 31 |
+
+当前可支持的结论：stability features 在这组 OOF 结果中提供了有希望的增量信号，61D 配置的 AUROC 和 AUPRC 均高于 57D baseline。与 AlphaMissense 比较时，AlphaMissense AUROC 更高，MISFIT 61D AUPRC 更高。尚未完成 paired confidence interval 或 statistical test，因此不能据此宣称任一模型显著优于另一模型；feature importance 也不能直接解释为因果贡献。
+
+### 6. Task 15：61D vs 64D TMD 增量实验（已运行）
+
+TMD 增量实验应在 `task15_full64.ipynb` 中完成；Task 14 只负责生成 TMD features，已恢复为原用途。
+
+Task 15 使用 Task 12 的相同 folds 和固定 61D OOF prediction，评估加入 3 个 TMD features 后的增量：
+
+- 固定复用 Task 12 的 folds 和 61D OOF prediction；
+- 64D = 61D + `in_TMD` + `dist_to_nearest_TMD` + `delta_membrane_insertion`；
+- 对 TMD 特征同样执行 fold-local preprocessing；
+- 在 full cohort 和 AlphaMissense paired cohort 上比较 61D 与 64D；
+- 保存 OOF predictions、metrics 和 feature importance。
+
+各 fold AUROC：
+
+| Fold | 61D | 64D | ΔAUROC |
+|---:|---:|---:|---:|
+| 0 | 0.6459 | 0.6608 | +0.0149 |
+| 1 | 0.5959 | 0.6314 | +0.0355 |
+| 2 | 0.5924 | 0.6483 | +0.0559 |
+| 3 | 0.6416 | 0.6344 | −0.0072 |
+| 4 | 0.6976 | 0.6743 | −0.0233 |
+
+Full-cohort OOF comparison（n = 2179，positive = 236，prevalence = 0.1083）：
+
+| Model | AUROC | AUPRC |
+|---|---:|---:|
+| Stability 61D | 0.6286 | 0.1758 |
+| Stability + TMD 64D | 0.6422 | 0.1981 |
+| 64D − 61D | +0.0135 | +0.0223 |
+
+Paired AlphaMissense cohort（n = 2140，positive = 235，prevalence = 0.1098）：
+
+| Predictor | AUROC | AUPRC |
+|---|---:|---:|
+| AlphaMissense | 0.6491 | 0.1619 |
+| Stability 61D | 0.6311 | 0.1780 |
+| Stability + TMD 64D | 0.6442 | 0.1999 |
+| 64D − AlphaMissense | −0.0048 | +0.0380 |
+
+64D 模型中的 DDG/TMD importance ranks：
+
+| Feature | Importance | Rank |
+|---|---:|---:|
+| `in_TMD` | 0.036551 | 1 |
+| `ddg_esm2` | 0.036359 | 2 |
+| `dist_to_nearest_TMD` | 0.029027 | 3 |
+| `delta_membrane_insertion` | 0.026835 | 4 |
+| `ddg_rasp` | 0.019963 | 7 |
+| `ddg_struct` | 0.015078 | 29 |
+| `ddg_foldx` | 0.013715 | 36 |
+
+当前结果支持 TMD features 具有进一步研究价值：64D 的 pooled OOF AUROC 和 AUPRC 均高于固定 61D，且三个 TMD features 的 importance 均位于前四名中的三个位置。不过，fold 3 和 fold 4 的 AUROC 下降，说明增益并非跨 fold 一致。尚无 paired bootstrap confidence interval 或 permutation test，因此不能将 `+0.0135` 和 `+0.0223` 描述为统计显著提升。与 AlphaMissense 相比，64D 的 AUROC 已接近，但仍低 0.0048；AUPRC 高 0.0380。
+
+### 7. Task 16：XGBoost vs TabPFN（8:1:1 held-out test，已运行）
+
+Task 16 使用 gene-disjoint 8:1:1 split，在相同 64D features 上比较 XGBoost、TabPFN 和 ensemble。Validation 选择的 TabPFN ensemble weight 为 0.60；最终评价只使用 held-out test。
+
+Full held-out test（n = 210，positive = 23，prevalence = 0.1095）：
+
+| Model | AUROC | AUPRC |
+|---|---:|---:|
+| XGBoost 64D | 0.6266 | 0.2075 |
+| TabPFN 64D | 0.6002 | 0.2441 |
+| Ensemble 64D | 0.6223 | 0.2056 |
+
+Paired AlphaMissense test subset（n = 204，positive = 22，prevalence = 0.1078）：
+
+| Predictor | AUROC | AUPRC |
+|---|---:|---:|
+| AlphaMissense | 0.6190 | 0.1552 |
+| XGBoost 64D | 0.6391 | 0.2113 |
+| TabPFN 64D | 0.6155 | 0.2500 |
+| Ensemble 64D | 0.6380 | 0.2096 |
+
+当前解释：
+
+- XGBoost 的 discrimination ranking 更稳定，在 full test 上 AUROC 比 TabPFN 高 0.0264。
+- TabPFN 的 full-test AUPRC 比 XGBoost 高 0.0366，说明它在正例优先排序方面可能具有互补信号；但 test 中只有 23 个正例，该差值的不确定性可能很大。
+- Validation 选择的 0.60 TabPFN ensemble 没有在 test 上超过 XGBoost：AUROC 低 0.0043，AUPRC 低 0.0019。因此当前不采用这个 ensemble。
+- 在 paired AlphaMissense test subset 上，XGBoost AUROC 和 AUPRC 均高于 AlphaMissense；TabPFN 的 AUPRC 最高，但 AUROC 略低于 AlphaMissense。该结果只适用于 204 行单次 held-out subset，不能替代 Task 15 的 2140 行 pooled OOF comparison。
+- Task 15 与 Task 16 的指标不可直接当作模型性能变化：前者是 5-fold pooled OOF，后者是单次约 10% held-out test。若要正式判断 XGBoost 与 TabPFN 的差异，需要对 test predictions 做 gene-cluster bootstrap confidence intervals，或运行 repeated gene-grouped holdout。
+
+### 8. Task 17：稳健性、模型决策与 error analysis（已运行）
+
+#### Gene-cluster bootstrap
+
+Task 15 full-cohort OOF 的 paired bootstrap differences：
+
+| Comparison | ΔAUROC mean (95% CI) | ΔAUPRC mean (95% CI) |
+|---|---:|---:|
+| 64D − 61D | +0.0133 (−0.0081, 0.0346) | +0.0229 (−0.0050, 0.0508) |
+| 64D − AlphaMissense, paired cohort | −0.0049 (−0.0481, 0.0379) | +0.0388 (−0.0063, 0.0862) |
+
+Task 16 paired held-out test differences：
+
+| Comparison | ΔAUROC mean (95% CI) | ΔAUPRC mean (95% CI) |
+|---|---:|---:|
+| TabPFN − XGBoost | −0.0216 (−0.1111, 0.0630) | +0.0394 (−0.0815, 0.1647) |
+| Ensemble − XGBoost | −0.0007 (−0.0555, 0.0522) | +0.0008 (−0.0649, 0.0643) |
+| XGBoost − AlphaMissense | +0.0182 (−0.1455, 0.1823) | +0.0523 (−0.0816, 0.2057) |
+
+所有 paired difference CI 都跨越 0。现有数据不支持 64D 显著优于 61D、不支持 MISFIT 显著优于 AlphaMissense，也不支持 TabPFN 或 ensemble 显著优于 XGBoost。**这是 Task 17 当时的历史决策**：在 DeepLoc experiment 完成前暂时保留 XGBoost 64D。当前 primary model 已由上方冻结规格更新为 XGBoost 70D；本段不能再作为当前模型选择结论引用。
+
+#### TMD robustness
+
+| Subgroup | n | Positive | 61D AUROC | 64D AUROC | ΔAUROC | 61D AUPRC | 64D AUPRC | ΔAUPRC |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Overall | 2179 | 236 | 0.6286 | 0.6422 | +0.0135 | 0.1758 | 0.1981 | +0.0223 |
+| `in_TMD` | 151 | 39 | 0.7035 | 0.6758 | −0.0277 | 0.4440 | 0.3926 | −0.0514 |
+| `outside_TMD` | 2028 | 197 | 0.6074 | 0.6158 | +0.0084 | 0.1480 | 0.1623 | +0.0143 |
+
+64D 的 fold-level AUROC 在 fold 0–2 提升，在 fold 3–4 下降；AUPRC 仅在 fold 3 下降。最重要的反常结果是：TMD features 在真正的 `in_TMD` subgroup 上同时降低 AUROC 和 AUPRC，整体增益来自数量占绝对多数的 `outside_TMD` 样本。多个 prediction change 最大的 genes 只有 1–4 个 variants，表明 feature importance 排名可能受少量 genes 或稀疏特征影响。因此，当前不能将总体提升解释为“模型更好地识别了 TMD variants”；需要进一步检查 TMD 编码、distance feature 的含义以及 gene-specific influence。
+
+#### Exploratory error analysis
+
+使用 full OOF predictions 上 F1 最大化得到探索性 threshold = 0.277045：TN = 1506、FP = 437、FN = 134、TP = 102，对应 sensitivity = 0.4322、specificity = 0.7751、precision = 0.1892。该 threshold 在同一 OOF 数据上选择，只用于描述错误结构，不能作为独立性能结果。
+
+- `in_TMD`：sensitivity = 0.7692、specificity = 0.5446、precision = 0.3704；模型更容易召回 TMD 正例，但产生较多 TMD false positives。
+- `outside_TMD`：sensitivity = 0.3655、specificity = 0.7892、precision = 0.1572；主要问题是漏掉正例。
+- fold 3 sensitivity 最低（0.3333）；fold 4 precision 最低（0.1374），再次表明 split sensitivity 明显。
+- Additional Benign Variants 有 9 FP；其中唯一正例被识别。由于该来源只有一个正例，不能对 sensitivity 作稳定推断。
+- AlphaMissense 缺失组只有一个正例且被漏判，样本量不足以判断 missingness effect。
+
+### 9. 本轮 notebook/file 变更清单
+
+| 文件 | 当前作用 |
+|---|---|
+| `task0_build_features_v3.ipynb` | 构建 2179 行 features；导出 canonical `KEY`；legacy key 仅查询旧 ESM cache |
+| `task0.5_complete_alphamissense.ipynb` | 补取缺失 AlphaMissense annotations 并记录 status |
+| `task1_alphamissense_baseline.ipynb` | 在 score 可用的 paired cohort 上计算 AlphaMissense baseline |
+| `task12_ddg_ablation.ipynb` | 57/58/60/61D stability ablation 与 paired AlphaMissense 比较 |
+| `task14_tmd_features.ipynb` | 生成 3 个 TMD features；保持原职责 |
+| `task15_full64.ipynb` | 使用相同 folds 对比固定 61D 与加入 TMD 后的 64D |
+| `task16_tabpfn.ipynb` | 使用 gene-disjoint 8:1:1 holdout，在统一 64D 数据口径下比较 XGBoost、TabPFN 与 validation-selected ensemble |
+| `task17_robustness_error_analysis.ipynb` | Gene-cluster bootstrap、主模型决策、TMD 稳健性和 exploratory error analysis |
+| `task18_deeploc_delta.ipynb` | DeepLoc WT context、全量 WT–MT inference、64D/70D/delta ablation 与 paired bootstrap |
+| `task18.md` | Task 18 代码、输出、限制及修正后的解释 |
+| `task19_deeploc_overlap_audit.ipynb` | Current UniProt annotation-status exploratory audit；不能替代 actual DeepLoc training-set exact-overlap audit |
+| `../mlp_trial/task1_mlp_64d_vs_70d.ipynb` | 固定 8:1:1 split 上的 MLP 64D/70D screening |
+| `../ft_trial/task1_ft_transformer_64d_vs_70d.ipynb` | 固定 8:1:1 split 上的 FT-Transformer 64D/70D screening |
+
+Task 0 → Task 19、MLP/FT screening 与固定 8:1:1 XGB70 benchmark 已完成。模型侧冻结 XGBoost 70D，不继续推进当前 MLP、FT-Transformer、TabPFN ensemble 或 DeepLoc delta models。下一步应优先进行 biological subgroup/error analysis、异常标签审查和 external/prospective validation；现有 fixed test 不再用于新一轮 hyperparameter tuning。
 
 ---
+
+## 历史实验记录（已被上述修正口径取代）
+
+以下内容保留用于追踪研究过程。凡涉及 `reloc_v3 > 0`、222 个正例、1288 维旧特征定义、非 canonical identifier 或旧 CV/preprocessing 的结果，均不应引用为当前最终结果。
 
 ## Task 1: AlphaMissense 同折基线 —— "我们要打败的那个数"
 
